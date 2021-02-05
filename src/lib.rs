@@ -25,13 +25,13 @@ pub struct IOObj<'a, T: Write + Read + Seek> {
     guard: &'a Mutex<T>
 }
 
-impl<'a, T: Read + Seek> PartialEq for IOObj<'a, T> {
+impl<'a, T> PartialEq for IOObj<'a, T> {
     fn eq(&self, other: &Self) -> bool {
         self.start_init == other.start_init && self.start == other.start && ptr::eq(self.guard, other.guard)
     }
 }
 
-impl<'a, T: Read + Seek> Clone for IOObj<'a, T> {
+impl<'a, T> Clone for IOObj<'a, T> {
     fn clone(&self) -> Self {
         Self {
             start_init: self.start_init,
@@ -42,9 +42,9 @@ impl<'a, T: Read + Seek> Clone for IOObj<'a, T> {
     }
 }
 
-impl<'a, T: Write + Read + Seek> Eq for IOObj<'a, T> {}
+impl<'a, T> Eq for IOObj<'a, T> {}
 
-impl<'a, T: Write + Read + Seek> Hash for IOObj<'a, T> {
+impl<'a, T> Hash for IOObj<'a, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.start_init.hash(state);
         self.start.hash(state);
@@ -52,7 +52,7 @@ impl<'a, T: Write + Read + Seek> Hash for IOObj<'a, T> {
     }
 }
 
-impl<'a, T: Write + Read + Seek> Read for IOObj<'a, T> {
+impl<'a, T: Read + Seek> Read for IOObj<'a, T> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.len == 0 {
@@ -69,7 +69,7 @@ impl<'a, T: Write + Read + Seek> Read for IOObj<'a, T> {
     }
 }
 
-impl<'a, T: Write + Read + Seek> Seek for IOObj<'a, T> {
+impl<'a, T> Seek for IOObj<'a, T> {
     #[inline]
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
 
