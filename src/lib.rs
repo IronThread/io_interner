@@ -75,7 +75,6 @@ impl<'a, T> Seek for IOObj<'a, T> {
 
         match pos {
             SeekFrom::Current(x) => {
-
                 if x.is_negative() { 
                     let x = x.abs() as u64;
                     let new_start = self.start.saturating_sub(x);
@@ -89,8 +88,13 @@ impl<'a, T> Seek for IOObj<'a, T> {
                 } else {
                     let x = x.abs() as u64;
 
-                    self.start += x;
-                    self.len = self.len.saturating_sub(x); 
+                    if x > self.len {
+                        self.start += self.len;
+                        self.len = 0;
+                    } else {
+                        self.start += x;
+                        self.len -= x;
+                    } 
                 }
                 Ok(self.start - self.start_init)
             }
@@ -98,33 +102,26 @@ impl<'a, T> Seek for IOObj<'a, T> {
                 let new_start = self.start_init + x;
                 
                 if new_start > self.start {
-                    self.len -= new_start - self.start; 
+                    self.seek(SeekFrom::Current((new_start - self.start) as i64))
                 } else {
-                    self.len += self.start - new_start;
+                    self.seek(SeekFrom::Current(-((self.start - new_start) as i64)))
                 }
-
-                Ok(x)
             }
             SeekFrom::End(x) => {
-                if x.is_negative() { 
-                    let x = x.abs() as u64;
-                    let new_len = (self.len + (self.start - self.start_init)).checked_sub(x);
+                let initial_len = self.len + (self.start - self.start_init);
 
-                    if new_len.is_none() {
+                self.seek(SeekFrom::Start(if x.is_negative() { 
+                    let x = x.abs() as u64;
+                    let new_start = initial_len.checked_sub(x);
+
+                    if new_start.is_none() {
                         return Err(io::ErrorKind::InvalidInput.into())
                     }
 
-                    let new_len = new_len.unwrap();
-                    self.start = self.start_init + new_len;
-                    self.len = new_len;
+                    new_start.unwrap()
                 } else {
-                    let x = x.abs() as u64;
-
-                    self.start += x;
-                    self.len = self.len.saturating_sub(x); 
-                };
-
-                Ok(self.start - self.start_init)
+                    initial_len
+                }))
             }
         }
     }
