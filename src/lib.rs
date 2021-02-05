@@ -216,6 +216,8 @@ fn io_op<R1: Read, R2: Read>(mut x: R1, mut y: R2, callback: impl Fn(&[u8], &[u8
         let readed1 = io::copy(&mut x, &mut buf1)? as usize;
         let readed2 = io::copy(&mut y, &mut buf2)? as usize;
 
+        drop((buf1, buf2));
+
         if !callback(&buf1[..readed1], &buf2[..readed2]) {
             break false
         }
