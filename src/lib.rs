@@ -207,16 +207,14 @@ fn io_op<R1: Read, R2: Read>(mut x: R1, mut y: R2, callback: impl Fn(&[u8], &[u8
     let mut buf2 = [0; 512];
 
     Ok(loop {
-        let mut buf1 = &mut buf1[..];
-        let mut buf2 = &mut buf2[..];
+        let mut buf1r = &mut buf1[..];
+        let mut buf2r = &mut buf2[..];
 
         let mut x = (&mut x).take(buf1.len() as _);
         let mut y = (&mut y).take(buf1.len() as _);
 
-        let readed1 = io::copy(&mut x, &mut buf1)? as usize;
-        let readed2 = io::copy(&mut y, &mut buf2)? as usize;
-
-        drop((buf1, buf2));
+        let readed1 = io::copy(&mut x, &mut buf1r)? as usize;
+        let readed2 = io::copy(&mut y, &mut buf2r)? as usize;
 
         if !callback(&buf1[..readed1], &buf2[..readed2]) {
             break false
