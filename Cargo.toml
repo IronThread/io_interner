@@ -1,0 +1,13 @@
+[package]
+name = "io_interner" 
+version = "0.1.0"
+authors = ["IronThread <santinofuenteskillian@gmail.com>"]
+edition = "2018"
+license = "Unlicense"
+readme = "README.md"
+description = "Little library for make a common storage out of an IO object."
+repository = "https://github.com/IronThread/io_interner"
+keywords = ["io","interner"]
+categories = []
+
+[dependencies]
