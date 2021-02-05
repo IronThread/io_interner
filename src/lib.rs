@@ -110,7 +110,7 @@ impl<'a, T> Seek for IOObj<'a, T> {
                     let x = x.abs() as u64;
                     let new_len = (self.len + (self.start - self.start_init)).checked_sub(x);
 
-                    if let None = new_len {
+                    if new_len.is_none() {
                         return Err(io::ErrorKind::InvalidInput.into())
                     }
 
@@ -192,7 +192,21 @@ impl<T: Write + Read + Seek> IOInterner<T> {
 /// # Errors
 /// 
 /// See [`io::copy`].
-pub fn eq<R1: Read, R2: Read>(mut x: R1, mut y: R2) -> io::Result<bool> {
+pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
+    io_op(x, y, PartialEq::eq)
+}
+
+/// Checks if the first contents of the reader `haystack` are the ones of `needle`,an empty needle
+/// is always true.
+/// 
+/// # Errors
+/// 
+/// See [`io::copy`].
+pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<bool> {
+    io_op(haystack, needle, <[u8]>::starts_with)
+}
+
+fn io_op<R1: Read, R2: Read>(mut x: R1, mut y: R2, callback: impl Fn(&[u8], &[u8]) -> bool) -> io::Result<bool> {
     let mut buf1 = [0; 512];
     let mut buf2 = [0; 512];
 
@@ -206,37 +220,7 @@ pub fn eq<R1: Read, R2: Read>(mut x: R1, mut y: R2) -> io::Result<bool> {
         let readed1 = io::copy(&mut x, &mut buf1)? as usize;
         let readed2 = io::copy(&mut y, &mut buf2)? as usize;
 
-        if buf1[..readed1] != buf2[..readed2] {
-            break false
-        }
-
-        if readed1 == 0 {
-            break true
-        }
-    })
-}
-
-/// Checks if the first contents of the reader `haystack` are the ones of `needle`,an empty needle
-/// is always true.
-/// 
-/// # Errors
-/// 
-/// See [`io::copy`].
-pub fn starts_with<R1: Read, R2: Read>(mut haystack: R1, mut needle: R2) -> io::Result<bool> {
-    let mut buf1 = [0; 512];
-    let mut buf2 = [0; 512];
-
-    Ok(loop {
-        let mut buf1 = &mut buf1[..];
-        let mut buf2 = &mut buf2[..];
-        
-        let mut x = (&mut haystack).take(buf1.len() as _);
-        let mut y = (&mut needle).take(buf1.len() as _);
-
-        let readed1 = io::copy(&mut x, &mut buf1)? as usize;
-        let readed2 = io::copy(&mut y, &mut buf2)? as usize;
-
-        if !buf1[..readed1].starts_with(&buf2[..readed2]) {
+        if !callback(&buf1[..readed1], &buf2[..readed2]) {
             break false
         }
 
