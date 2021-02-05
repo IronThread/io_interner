@@ -63,8 +63,7 @@ impl<'a, T: Read + Seek> Read for IOObj<'a, T> {
         l.seek(SeekFrom::Start(self.start))?;
 
         let len = <&mut T as Read>::take(&mut *l, self.len).read(buf)?;
-        self.start += len as u64;
-        self.len -= len as u64;
+        self.seek(SeekFrom::Current(len as _))?;
         Ok(len)
     }
 }
