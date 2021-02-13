@@ -29,7 +29,7 @@ impl<'a, T> IOEntry<'a, T> {
     /// end up changing the data it points.
     pub fn get_object(&self) -> IOObj<'a, T> {
         IOObj {
-            start: 0,
+            start: self.start_init,
             start_init: self.start_init,
             len: self.len,
             guard: self.guard
