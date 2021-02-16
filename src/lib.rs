@@ -147,11 +147,11 @@ impl<'a, T> IOObj<'a, T> {
     /// Converts back to an [`IOEntry`].
     #[inline]
     pub fn to_entry(&self) -> IOEntry<'a, T> {
-        let a = self.clone();
+        let mut a = unsafe { ptr::read(self) };
         a.seek(SeekFrom::Start(0)).unwrap();
 
         IOEntry {
-            start: a.start,
+            start_init: a.start,
             len: a.len,
             guard: a.guard,
         }
@@ -182,7 +182,7 @@ impl<'a, T: Read + Seek> Read for IOObj<'a, T> {
 
 impl<'a, T: Read + Seek> PartialEq for IOObj<'a, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.fields_eq(other) || eq(self.clone(), other.clone())
+        self.fields_eq(other) || unsafe { crate::eq(ptr::read(self), ptr::read(other)).expect("io error while testing for equality") }
     }
 }
 
@@ -190,7 +190,7 @@ impl<'a, T: Read + Seek> Eq for IOObj<'a, T> {}
 
 impl<'a, T: Read + Seek> Hash for IOObj<'a, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        hash(self.clone(), state)
+        crate::hash(unsafe { ptr::read(self) }, state).expect("io error while hashing")
     }
 }
 
@@ -206,7 +206,7 @@ impl<'a, T: Read + Seek> Ord for IOObj<'a, T> {
             return Equal;
         }
 
-        cmp(self.clone(), other.clone())
+        unsafe { crate::cmp(ptr::read(self), ptr::read(other)).expect("io error while comparing the order") }
     }
 }
 
@@ -302,7 +302,7 @@ pub fn io_op<R1: Read, R2: Read, T>(
 ///
 /// See [`io_op`].
 pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
-    io_op(x, y, |x, y| if x == y { None } else { Some(()) }).map(Option::is_none)
+    io_op(x, y, |x, y| if x == y { None } else { Some(()) }).map(|e| e.is_none())
 }
 
 /// Checks if the first contents of the reader `haystack` are the ones of `needle`,an empty needle
@@ -312,7 +312,7 @@ pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
 ///
 /// See [`io_op`].
 pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<bool> {
-    io_op(haystack, needle, |haystack, needle| if haystack.starts_with(needle) { None } else { Some(()) }).map(Option::is_none)
+    io_op(haystack, needle, |haystack, needle| if haystack.starts_with(needle) { None } else { Some(()) }).map(|e| e.is_none())
 }
 
 /// Compares the contents of `x` to the ones of `y`,see
@@ -356,5 +356,7 @@ pub fn hash<R1: Read, H: Hasher>(
         }
     }
 
-    state.hash(len);
+    len.hash(state);
+
+    Ok(())
 }
