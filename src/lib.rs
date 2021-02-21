@@ -1,31 +1,48 @@
+#![feature(seek_stream_len)]
+
 //! A simple crate implementing a struct wrapping a reader and writer that's used to create readers
 //! to unique data.
 
-use ::std::{
+pub(crate) use ::std::{
     cmp::Ordering::{self, Equal},
     hash::{Hash, Hasher},
-    io::{self, prelude::*, SeekFrom},
+    io::{self, prelude::*, Cursor, SeekFrom},
     ptr,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
+};
+
+#[cfg(feature = "serde_support")]
+pub(crate) use ::{
+    serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer},
+    serde_derive::*,
 };
 
 /// A struct wrapping a `Mutex<T>` used for storing and retrieving data thought readers.
 ///
 /// Note that `T` it's wrapped into a [`Mutex`] for ensure [`IOObj`] does not lock access to the
 /// `IOInterner` and to guarantee will only lock at `Read` methods.
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct IOInterner<T: Write + Read + Seek> {
     /// The underlying writer wrapped into a `Mutex`.
     ///
-    /// The [`IOEntry`] comparison algorithm would mess up if you do not ensure that already
-    /// allocated data remain equal after releasing a lock,it's advisable to only write at the end.
-    pub inner: Mutex<T>
+    /// The data pointed by existing [`IOEntry`] instances would change and thus the comparison
+    /// algorithm would mess up if you do not ensure that already existing data remain equal after
+    /// releasing a lock,it's advisable to only write at the end.
+    pub inner: Mutex<T>,
 }
 
 impl<T: Write + Read + Seek> IOInterner<T> {
     /// Create a new `IOInterner` that uses as common storage `x`.
     #[inline]
     pub fn new(x: T) -> Self {
-        Self { inner: Mutex::new(x) }
+        Self {
+            inner: Mutex::new(x),
+        }
+    }
+
+    /// Convenience for `Self::new(Cursor::new(x))`.
+    pub fn from_vec(x: Vec<u8>) -> IOInterner<Cursor<Vec<u8>>> {
+        IOInterner::new(Cursor::new(x))
     }
 
     /// Invokes [`Write::flush`] on `self.inner`.
@@ -63,16 +80,18 @@ impl<T: Write + Read + Seek> IOInterner<T> {
 
         let len = l.seek(SeekFrom::End(0))?;
 
+        let mut pos = IOPos {
+            start_pos: len,
+            len: buf_len,
+        };
+
         for start in 0..len.saturating_sub(buf_len) {
             l.seek(SeekFrom::Start(start))?;
             buf.seek(SeekFrom::Start(0))?;
 
             if starts_with(&mut *l, &mut buf)? {
-                return Ok(IOEntry {
-                    start_init: start,
-                    len: buf_len,
-                    guard: &self.inner,
-                });
+                pos.start_pos = start;
+                return Ok(self.get_pos(pos));
             }
         }
 
@@ -81,11 +100,22 @@ impl<T: Write + Read + Seek> IOInterner<T> {
         io::copy(&mut buf, &mut *l)?;
         l.flush()?;
 
-        Ok(IOEntry {
-            start_init: len,
-            len: buf_len,
+        Ok(self.get_pos(pos))
+    }
+
+    /// Convenience for `self.get_or_intern(io::Cursor::new(bytes))`.
+    pub fn get_or_intern_bytes(&self, bytes: impl AsRef<[u8]>) -> io::Result<IOEntry<'_, T>> {
+        self.get_or_intern(Cursor::new(bytes))
+    }
+
+    /// Creates an [`IOEntry`] out it's first [`IOPos`].
+    #[inline]
+    pub fn get_pos(&self, pos: IOPos) -> IOEntry<'_, T> {
+        IOEntry {
+            start_init: pos.start_pos,
+            len: pos.len,
             guard: &self.inner,
-        })
+        }
     }
 }
 
@@ -109,24 +139,29 @@ impl<'a, T> IOEntry<'a, T> {
             start_init: self.start_init,
             start: self.start_init,
             len: self.len,
-            guard: self.guard
+            guard: self.guard,
         }
+    }
+
+    /// Gets the first [`IOPos`] the [`IOObj`] would have before creating it with
+    /// [`Self::get_obect`].
+    #[inline]
+    pub fn position(&self) -> IOPos {
+        self.get_object().position()
     }
 }
 
 impl<'a, T> PartialEq for IOEntry<'a, T> {
     /// Compares the start position of `self` in the interner and it's length to `other`;returning
     /// `false` if either are different,`true` otherwise.
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// It panics if `self` and `other` were created from different [`IOInterner`]s.
     fn eq(&self, other: &Self) -> bool {
-        if ptr::eq(self.guard, other.guard) {
-            self.start_init == other.start_init && self.len == other.len
-        } else {
-            panic!("entries from different interners cannot be compared,consider use `IOEntry::get_object` to create `IOObj`ects")
-        }
+        assert_eq!(self.guard as *const _, other.guard as *const _, "entries from different interners cannot be compared,consider use `IOEntry::get_object` to create `IOObj`ects");
+
+        self.position() == other.position()
     }
 }
 
@@ -135,7 +170,7 @@ impl<'a, T> Eq for IOEntry<'a, T> {}
 impl<'a, T> Hash for IOEntry<'a, T> {
     /// Hash the start position of the entry and the length.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.start_init, self.len).hash(state);
+        self.position().hash(state);
     }
 }
 
@@ -168,7 +203,15 @@ impl<'a, T> IOObj<'a, T> {
     }
 
     fn fields_eq(&self, other: &Self) -> bool {
-        ptr::eq(self.guard, other.guard) && self.start == other.start && self.len == other.len 
+        ptr::eq(self.guard, other.guard) && self.position() == other.position()
+    }
+
+    /// See [`IOPos`].
+    pub fn position(&self) -> IOPos {
+        IOPos {
+            start_pos: self.start,
+            len: self.len,
+        }
     }
 }
 
@@ -192,7 +235,8 @@ impl<'a, T: Read + Seek> Read for IOObj<'a, T> {
 
 impl<'a, T: Read + Seek> PartialEq for IOObj<'a, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.fields_eq(other) || eq(self.clone(), other.clone()).expect("io error while testing for equality")
+        self.fields_eq(other)
+            || eq(self.clone(), other.clone()).expect("io error while testing for equality")
     }
 }
 
@@ -269,17 +313,39 @@ impl<'a, T> Seek for IOObj<'a, T> {
     }
 }
 
+/// Struct stating which data [`IOObj`] will read from the [`IOInterner`] internal IO object.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
+pub struct IOPos {
+    /// The start position on which the [`IOObj`] can read in the next [`Read::read`].
+    pub start_pos: u64,
+    /// The max amount of bytes this [`IOObj`] can read in the next [`Read::read`].
+    pub len: u64,
+}
+
+impl PartialOrd for IOPos {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IOPos {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.len.cmp(&other.len)
+    }
+}
+
 /// Pass to `callback` slices with lenght up to 512 contained in both readers until either one
 /// reach EOF and returns `None` or when `callback` returns `Some`,that case this function will
 /// return it.
-/// 
+///
 /// # Errors
-/// 
+///
 /// See [`io::copy`].
 pub fn io_op<R1: Read, R2: Read, T>(
     mut x: R1,
     mut y: R2,
-    callback: impl Fn(&[u8], &[u8]) -> Option<T>,
+    mut callback: impl FnMut(&[u8], &[u8]) -> Option<T>,
 ) -> io::Result<Option<T>> {
     let mut buf1 = [0; 512];
     let mut buf2 = [0; 512];
@@ -293,7 +359,7 @@ pub fn io_op<R1: Read, R2: Read, T>(
 
         let readed1 = io::copy(&mut x, &mut buf1r)? as usize;
         let readed2 = io::copy(&mut y, &mut buf2r)? as usize;
-    
+
         let a = callback(&buf1[..readed1], &buf2[..readed2]);
 
         if a.is_some() {
@@ -322,51 +388,195 @@ pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
 ///
 /// See [`io_op`].
 pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<bool> {
-    io_op(haystack, needle, |haystack, needle| if haystack.starts_with(needle) { None } else { Some(()) }).map(|e| e.is_none())
+    io_op(haystack, needle, |haystack, needle| {
+        let f = if haystack.len() < 512 {
+            <[u8]>::starts_with
+        } else {
+            <[u8]>::eq
+        };
+
+        if f(haystack, needle) {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .map(|e| e.is_none())
 }
 
 /// Compares the contents of `x` to the ones of `y`,see
 /// [`lexicographical comparison`][`Ord#lexicographical-comparison`].
-/// 
+///
 /// # Errors
 ///
 /// See [`io_op`].
 pub fn cmp<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<Ordering> {
     io_op(x, y, |x, y| match x.cmp(y) {
         Equal => None,
-        x => Some(x)
-    }).map(|e| e.unwrap_or(Equal))
+        x => Some(x),
+    })
+    .map(|e| e.unwrap_or(Equal))
 }
 
 /// Hash the contents of the reader `x` to `state`.
 ///
 /// # Errors
 ///
-/// See [`io::copy`].
-pub fn hash<R1: Read, H: Hasher>(
-    mut x: R1,
-    state: &mut H,
-) -> io::Result<()> {
-    let mut buf1 = [0; 512];
-
+/// See [`io_unary_op`].
+pub fn hash<R1: Read, H: Hasher>(x: R1, state: &mut H) -> io::Result<()> {
     let mut len = 0;
 
-    loop {
+    let _: Option<()> = io_unary_op(x, |x| {
+        Hash::hash_slice(x, state);
+        len += x.len();
+        None
+    })?;
+
+    len.hash(state);
+
+    Ok(())
+}
+
+/// Like [`io_op`],but with only one reader and slice passed down to `callback`.
+///
+/// # Errors
+///
+/// See [`io::copy`].
+pub fn io_unary_op<R1: Read, T>(
+    mut x: R1,
+    mut callback: impl FnMut(&[u8]) -> Option<T>,
+) -> io::Result<Option<T>> {
+    let mut buf1 = [0; 512];
+
+    Ok(loop {
         let mut buf1r = &mut buf1[..];
 
         let mut x = Read::take(&mut x, buf1r.len() as _);
 
         let readed1 = io::copy(&mut x, &mut buf1r)? as usize;
 
-        Hash::hash_slice(&buf1[..readed1], state);
-        len += readed1;        
+        let a = callback(&buf1[..readed1]);
+
+        if a.is_some() {
+            break a;
+        }
 
         if readed1 == 0 {
-            break;
+            break None;
+        }
+    })
+}
+
+#[cfg(feature = "serde_support")]
+pub mod serde {
+    use super::*;
+
+    /// Serializes the contents of `x` to `serializer`.
+    ///
+    /// # Errors
+    ///
+    /// if [`io_op`] fails an `Err` variant of `io::Result` it's returned,otherwise a
+    /// `Result<S::Ok, S::Error>`.
+    pub fn serialize<R1: Seek + Read, S: Serializer>(
+        mut x: R1,
+        serializer: S,
+    ) -> io::Result<Result<S::Ok, S::Error>> {
+        Ok(loop {
+            let mut serializer = match serializer.serialize_seq(Some(x.stream_len()? as _)) {
+                Ok(e) => e,
+                Err(e) => break Err(e),
+            };
+
+            break io_unary_op(x, |x| serializer.serialize_element(x).err())?
+                .map(|x| Err(x))
+                .unwrap_or_else(|| serializer.end());
+        })
+    }
+
+    /// Error variant of used by the fn [`serialize_flatten`].
+    #[derive(Debug)]
+    pub enum SerIOErr<S: Serializer> {
+        IO(io::Error),
+        Ser(S::Error),
+    }
+
+    /// Convenience to the fn [`serialize`] except for that it flattens the result thought
+    /// returning `Ok` when the former does `Ok(Ok)`,and wraps the two diferrent `Err` variants
+    /// into a [`SerIOErr`].
+    pub fn serialize_flatten<R1: Seek + Read, S: Serializer>(
+        x: R1,
+        serializer: S,
+    ) -> Result<S::Ok, SerIOErr<S::Error>> {
+        Err(match serialize(x, serializer) {
+            Ok(Ok(x)) => return Ok(x),
+            Ok(Err(e)) => SerIOErr::Ser(e),
+            Err(e) => SerIOErr::IO(e),
+        })
+    }
+
+    /// Struct [io entries][`IOEntry`] serialize to.
+    #[derive(Serialize, Deserialize)]
+    pub struct ToIOEntry<T: Read + Write + Seek> {
+        interner_id: usize,
+        interner: Option<IOInterner<T>>,
+        pos: IOPos,
+    }
+
+    impl<T: Read + Write + Seek> ToIOEntry<T> {
+        /// Returns an [`IOInterner`] in which both `self` and `other` can get the original
+        /// [io entries][`IOEntry`] serialized into this data type.
+        ///
+        /// # Errors
+        ///
+        /// Returns `None` if the two args were serialized from [io entries][`IOEntry`] on different
+        /// interners or neither one were the first one on being serialized,or if the method already
+        /// returned `Some` and you call it again with same args.
+        pub fn get_interner(&mut self, other: &mut Self) -> Option<IOInterner<T>> {
+            bool::then(self.same_interner(other), || {
+                self.interner.take().or_else(|| other.interner.take())
+            })
+            .flatten()
+        }
+
+        /// The position the [`IOEntry`] pointed to.
+        pub fn position(&self) -> IOPos {
+            self.pos
+        }
+
+        /// Returns `true` if the two [io entries][`IOEntry`] serialized from `self` and `other` came
+        /// from the same interner,`false` otherwise.
+        pub fn same_interner(&self, other: &Self) -> bool {
+            self.interner_id == other.interner_id
         }
     }
 
-    len.hash(state);
+    impl<'a, T: Serialize> Serialize for IOEntry<'a, T> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let transform = |x: usize| -> usize { x.rotate_left(x.leading_zeros()) };
 
-    Ok(())
+            let interner_id = transform(self.guard as *const _ as _);
+
+            lazy_static::lazy_static! {
+                static ref SERIALIZED: RwLock<Vec<usize>> = RwLock::new(Vec::new());
+            }
+
+            let first_entry = !SERIALIZED.read().unwrap().contains(&interner_id);
+
+            if first_entry {
+                SERIALIZED.write().unwrap().push(interner_id);
+            }
+
+            let mut s = serializer.serialize_struct("ToIOEntry", 3)?;
+            s.serialize_field("interner_id", &interner_id)?;
+            s.serialize_field("interner", &bool::then(first_entry, || self.guard))?;
+            s.serialize_field("pos", &self.position())?;
+            s.end()
+        }
+    }
+
+    impl<'a, T: Seek + Read> Serialize for IOObj<'a, T> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serialize(self.clone(), serializer).expect("io error while serializing")
+        }
+    }
 }
