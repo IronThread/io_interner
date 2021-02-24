@@ -19,3 +19,4 @@ lazy_static = { version = "1", optional = true }
 
 [features]
 serde_support = ["serde", "serde_derive", "lazy_static"]
+nightly = []
