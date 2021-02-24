@@ -1,3 +1,5 @@
+#![allow(clippy::upper_case_acronyms)]
+
 //! A simple crate implementing a struct wrapping a reader and writer that's used to create readers
 //! to unique data.
 
@@ -18,7 +20,10 @@ pub(crate) use ::{
         ser::{Serialize, SerializeSeq, SerializeStruct, Serializer},
     },
     serde_derive::*,
-    std::sync::RwLock,
+    std::{
+        mem,
+        sync::RwLock,
+    },
 };
 
 /// A struct wrapping a `Mutex<T>` used for storing and retrieving data thought readers.
@@ -373,11 +378,18 @@ impl PartialOrd for IOPos {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for IOPos {
     fn cmp(&self, other: &Self) -> Ordering {
         self.len.cmp(&other.len)
     }
 }
+
+/// Internal buffer length used in many free functions of this crate,put here if in the future some
+/// way of create it at compile time it's implemented,only thinkable way it's
+/// `option_env!("IOINTERNER_BUF_LEN").and_then(|e| e.trim().parse().ok()).unwrap_or(512)` but,
+/// except for `option_env!` and `Option::{and_then, unwrap_or}`,cannot be put into a constant.
+pub const BUF_LEN: usize = 512;
 
 /// Pass to `callback` slices with lenght up to 512 contained in both readers until either one
 /// reach EOF and returns `None` or when `callback` returns `Some`,that case this function will
@@ -386,14 +398,11 @@ impl Ord for IOPos {
 /// # Errors
 ///
 /// See [`io::copy`].
-pub fn io_op<R1: Read, R2: Read, T, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(
+pub fn io_op<R1: Read, R2: Read, T>(
     mut x: R1,
     mut y: R2,
     mut callback: impl FnMut(&[u8], &[u8]) -> Option<T>,
 ) -> io::Result<Option<T>> {
-    #[cfg(not(feature = "nightly"))]
-    const BUF_LEN: usize = 512;
-
     let mut buf1 = [0; BUF_LEN];
     let mut buf2 = [0; BUF_LEN];
 
@@ -424,8 +433,8 @@ pub fn io_op<R1: Read, R2: Read, T, #[cfg(feature = "nightly")]const BUF_LEN: us
 /// # Errors
 ///
 /// See [`io_op`].
-pub fn eq<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(x: R1, y: R2) -> io::Result<bool> {
-    io_op::<_, _; BUF_LEN>(x, y, |x, y| if x == y { None } else { Some(()) }).map(|e| e.is_none())
+pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
+    io_op(x, y, |x, y| if x == y { None } else { Some(()) }).map(|e| e.is_none())
 }
 
 /// Checks if the first contents of the reader `haystack` are the ones of `needle`,an empty needle
@@ -434,8 +443,8 @@ pub fn eq<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN: usize = 
 /// # Errors
 ///
 /// See [`io_op`].
-pub fn starts_with<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(haystack: R1, needle: R2) -> io::Result<bool> {
-    io_op::<_, _; BUF_LEN>(haystack, needle, |haystack, needle| {
+pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<bool> {
+    io_op(haystack, needle, |haystack, needle| {
         if haystack.starts_with(needle) {
             None
         } else {
@@ -450,8 +459,8 @@ pub fn starts_with<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN:
 /// # Errors
 ///
 /// See [`io_op`].
-pub fn cmp<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(x: R1, y: R2) -> io::Result<Ordering> {
-    io_op::<_, _, BUF_LEN>(x, y, |x, y| match x.cmp(y) {
+pub fn cmp<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<Ordering> {
+    io_op(x, y, |x, y| match x.cmp(y) {
         Equal => None,
         x => Some(x),
     })
@@ -463,10 +472,10 @@ pub fn cmp<R1: Read, R2: Read, #[cfg(feature = "nightly")]const BUF_LEN: usize =
 /// # Errors
 ///
 /// See [`io_unary_op`].
-pub fn hash<R1: Read, H: Hasher, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(x: R1, state: &mut H) -> io::Result<()> {
+pub fn hash<R1: Read, H: Hasher>(x: R1, state: &mut H) -> io::Result<()> {
     let mut len = 0;
 
-    let _: Option<()> = io_unary_op::<_, _, BUF_LEN>(x, |x| {
+    let _: Option<()> = io_unary_op(x, |x| {
         Hash::hash_slice(x, state);
         len += x.len();
         None
@@ -483,23 +492,20 @@ pub fn hash<R1: Read, H: Hasher, #[cfg(feature = "nightly")]const BUF_LEN: usize
 /// # Errors
 /// 
 /// See [`io_unary_op`].
-pub fn to_utf8<R: Read, F: FnMut(Option<&str>), #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(mut reader: R, mut callback: F) -> io::Result<()> {
-        let mut invalid_slice: Option<&[u8]> = None;
+pub fn to_utf8<R: Read, F: FnMut(Option<&str>)>(reader: R, mut callback: F) -> io::Result<()> {
+        let mut invalid_slice: Option<usize> = None;
         let mut invalid_buf = [0; 4];
 
-        io_unary_op::<_, _; BUF_LEN>(reader, |mut stream| {
-            if let Some(slice) = invalid_slice.take() {
-                let mut len = slice.len();
+        io_unary_op(reader, |mut stream| {
+            if let Some(mut len) = invalid_slice.take() {
                 let orig_len = len;
                 let mut valid = true;
 
-                let mut it = stream.iter();
-
-                while let Some(b) = it.next() {
+                for b in stream.iter() {
                     len += 1;
                     valid = len <= 4;    
 
-                    if str::from_utf8(slice::from_ref(b)).is_ok() {
+                    if (*b as i8) >= -0x40 {
                         break;                                                    
                     }
                 }
@@ -509,7 +515,12 @@ pub fn to_utf8<R: Read, F: FnMut(Option<&str>), #[cfg(feature = "nightly")]const
                 let (may_valid, valid_one) = stream.split_at(dlen);
 
                 if valid {
-                    to_utf8_internal(may_valid, &mut callback).unwrap();
+                    // directly after `may_valid` it's `valid_one` so it's impossible to the error
+                    // to be expecting bytes that are ahead,the `dlen` byte it's an codepoint
+                    // starting one
+                    if to_utf8_internal(may_valid, &mut callback).is_some() {
+                        callback(None)
+                    }
                 } else {
                     callback(None);
                 }
@@ -520,14 +531,11 @@ pub fn to_utf8<R: Read, F: FnMut(Option<&str>), #[cfg(feature = "nightly")]const
             if let Some(e) = to_utf8_internal(stream, &mut callback) {
                 let slice = &mut invalid_buf[..e.len()];
                 slice.copy_from_slice(e);
-                invalid_slice = Some(slice);
+                invalid_slice = Some(slice.len());
             }
 
             None
-        }).map(|e| match e {
-            Some(()) => {}
-            x => {}
-        })
+        }).map(|_: Option<()>| ())
 }
 
 fn to_utf8_internal<F: FnMut(Option<&str>)>(mut input: &[u8], mut callback: F) -> Option<&[u8]> {
@@ -560,12 +568,10 @@ fn to_utf8_internal<F: FnMut(Option<&str>)>(mut input: &[u8], mut callback: F) -
 /// # Errors
 ///
 /// See [`io::copy`].
-pub fn io_unary_op<R1: Read, T, #[cfg(feature = "nightly")]const BUF_LEN: usize = 512>(
+pub fn io_unary_op<R1: Read, T>(
     mut x: R1,
     mut callback: impl FnMut(&[u8]) -> Option<T>,
 ) -> io::Result<Option<T>> {
-    #[cfg(not(feature = "nightly"))]
-    const BUF_LEN: usize = 512;
 
     let mut buf1 = [0; BUF_LEN];
 
@@ -592,6 +598,20 @@ pub fn io_unary_op<R1: Read, T, #[cfg(feature = "nightly")]const BUF_LEN: usize 
 pub mod serde {
     use super::*;
 
+    #[inline]
+    fn stream_len(mut x: impl Seek) -> io::Result<u64> {
+        let pos = x.seek(SeekFrom::Current(0))?;
+        let len = x.seek(SeekFrom::End(0))?;
+
+        if pos == len {
+            return Ok(len)
+        }
+
+        x.seek(SeekFrom::Start(pos))?;
+
+        Ok(len)
+    }
+
     impl<T: Write + Read + Seek + Serialize> Serialize for IOInterner<T> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             self.inner.serialize(serializer)
@@ -617,7 +637,7 @@ pub mod serde {
         serializer: S,
     ) -> io::Result<Result<S::Ok, S::Error>> {
         Ok(loop {
-            let mut serializer = match serializer.serialize_seq(Some(x.stream_len().map(|e| e / BUF_LEN)? as _)) {
+            let mut serializer = match serializer.serialize_seq(Some(stream_len(&mut x).map(|e| e as usize / BUF_LEN)? as _)) {
                 Ok(e) => e,
                 Err(e) => break Err(e),
             };
@@ -710,11 +730,11 @@ pub mod serde {
 
     fn contains(needle: usize, x: &[usize]) -> bool {
         fn bytes<T: ?Sized>(x: &T) -> &[u8] {
-            unsafe { from_raw_parts(x as *const _ as *const u8, mem::size_of_val(x)) }
+            unsafe { slice::from_raw_parts(x as *const _ as *const u8, mem::size_of_val(x)) }
         }
 
-        let needle = bytes(needle);
-        let mut haystack = bytes(x);
+        let needle = bytes(&needle);
+        let mut haystack = bytes(&x);
 
         while let Some(e) = memchr::memchr(needle[0], haystack) {
             haystack = &haystack[e + 1..];

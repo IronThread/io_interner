@@ -16,7 +16,8 @@ sync_2 = "1"
 serde = { version = "1", optional = true }
 serde_derive = { version = "1", optional = true }
 lazy_static = { version = "1", optional = true }
+memchr = { version = "2", optional = true }
 
 [features]
-serde_support = ["serde", "serde_derive", "lazy_static"]
+serde_support = ["serde", "serde_derive", "lazy_static", "memchr"]
 nightly = []
