@@ -3,6 +3,8 @@
 //! A simple crate implementing a struct wrapping a reader and writer that's used to create readers
 //! to unique data.
 
+#![allow(unused)]
+
 pub(crate) use ::std::{
     cmp::Ordering::{self, Equal},
     collections::VecDeque,
@@ -552,7 +554,7 @@ pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<b
 /// # Errors
 /// 
 /// See [`io_op`].
-pub fn find<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, mut needle: R2) -> io::Result<Option<IOPos>> {
+pub fn find<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, needle: R2) -> io::Result<Option<IOPos>> {
         let l = &mut haystack;
         let mut buf = needle;
 
@@ -630,7 +632,7 @@ pub fn find<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, mut needle: R2) 
 /// # Errors
 /// 
 /// See [`io_op`].
-pub fn rfind<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, mut needle: R2) -> io::Result<Option<IOPos>> {
+pub fn rfind<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, needle: R2) -> io::Result<Option<IOPos>> {
         let l = &mut haystack;
         let mut buf = needle;
 
