@@ -5,6 +5,8 @@
 
 pub(crate) use ::std::{
     cmp::Ordering::{self, Equal},
+    collections::VecDeque,
+    convert::TryFrom,
     hash::{Hash, Hasher},
     io::{self, prelude::*, Cursor, SeekFrom},
     ptr,
@@ -17,7 +19,7 @@ pub(crate) use ::std::{
 pub(crate) use ::{
     serde::{
         de::{Deserialize, Deserializer},
-        ser::{Serialize, SerializeSeq, SerializeStruct, Serializer},
+        ser::{Serialize, SerializeSeq, Serializer},
     },
     serde_derive::*,
     std::{
@@ -30,6 +32,7 @@ pub(crate) use ::{
 ///
 /// Note that `T` it's wrapped into a [`Mutex`] for ensure [`IOObj`] does not lock access to the
 /// `IOInterner` and to guarantee will only lock at `Read` methods.
+#[derive(Default, Debug)]
 pub struct IOInterner<T: Write + Read + Seek + ?Sized> {
     /// The underlying writer wrapped into a `Mutex`.
     ///
@@ -39,13 +42,67 @@ pub struct IOInterner<T: Write + Read + Seek + ?Sized> {
     pub inner: Mutex<T>,
 }
 
+impl<T: Write + Read + Seek + Clone> Clone for IOInterner<T> {
+    fn clone(&self) -> Self {
+        Self::new(Clone::clone(&*self.inner.lock().unwrap_or_else(|e| e.into_inner())))
+    }
+}
+
+impl<T: Write + Read + Seek + ?Sized> Write for IOInterner<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Write::write(&mut &*self, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut &*self)
+    }
+}
+
+impl<'a, T: Write + Read + Seek + ?Sized> Write for &'a IOInterner<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+impl<T: Write + Read + Seek + ?Sized> Read for IOInterner<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Read::read(&mut &*self, buf)
+    }
+}
+
+impl<'a, T: Write + Read + Seek + ?Sized> Read for &'a IOInterner<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().read(buf)
+    }
+}
+
+impl<T: Write + Read + Seek + ?Sized> Seek for IOInterner<T> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        Seek::seek(&mut &*self, pos)
+    }
+}
+
+impl<'a, T: Write + Read + Seek + ?Sized> Seek for &'a IOInterner<T> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.lock().unwrap().seek(pos)
+    }
+}
+
 impl<T: Write + Read + Seek> IOInterner<T> {
+    fn from_inner(inner: Mutex<T>) -> Self {
+        Self {
+            inner
+        }
+    }
+
     /// Create a new `IOInterner` that uses as common storage `x`.
     #[inline]
     pub fn new(x: T) -> Self {
-        Self {
-            inner: Mutex::new(x),
-        }
+        Self::from_inner(Mutex::new(x))
     }
 
     /// Create a new `IOInterner` that uses as common storage `x`.
@@ -60,34 +117,108 @@ impl<T: Write + Read + Seek> IOInterner<T> {
     /// 
     /// See [`Mutex::into_inner`].
     pub fn map<U: Write + Read + Seek, F: FnOnce(T) -> U>(self, f: F) -> Result<IOInterner<U>, PoisonError<T>> {
-        self.inner.into_inner().map(|e| IOInterner::new(f(e)))
+        self.inner.into_inner().map(f).map(IOInterner::new)
     }
 }
 
 impl<T: Write + Read + Seek + ?Sized> IOInterner<T> {
-    /// Convenience for `Self::new(Cursor::new(x))`.
-    #[inline]
-    pub fn from_vec(x: Vec<u8>) -> IOInterner<Cursor<Vec<u8>>> {
-        IOInterner::new(Cursor::new(x))
-    }
-
-    /// Invokes [`Write::flush`] on `self.inner`.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if the [`Mutex`] it's poisoned.
-    #[inline]
-    pub fn flush(&self) -> io::Result<()> {
-        self.inner.lock().unwrap().flush()
-    }
-
     /// Like [`Self::get_or_intern`] instead that will return also a `bool` indicating whether the
     /// entry was not there before.
     /// 
     /// # Errors
     /// 
     /// See [`Self::get_or_intern`].
-    pub fn try_intern<U: Read + Seek>(&self, mut buf: U) -> io::Result<(IOEntry<'_, T>, bool)> {
+    pub fn try_intern<U: Read + Seek>(&self, mut buf: U) -> io::Result<(IOObj<'_, T>, bool)> {
+        let mut l = self.inner.lock().unwrap();
+
+        let buf_len = buf.seek(SeekFrom::End(0))?;
+
+        if buf_len == 0 {
+            return Ok((IOObj {
+                start_init: 0,
+                start: 0,
+                len: 0,
+                guard: &self.inner,
+            }, false));
+        }
+
+        let len = l.seek(SeekFrom::End(0))?;
+
+        let mut pos = IOPos {
+            start_pos: len,
+            len: buf_len,
+        };
+
+        let mut temp_buf = Vec::new();
+
+        if len == buf_len {
+            if eq(&mut *l, &mut buf)? {
+                pos.start_pos = 0;
+                return Ok((self.get_pos(pos), false))
+            }
+        } else if buf_len < len {
+            let mut intern_buf = VecDeque::new();
+
+            buf.seek(SeekFrom::Start(0))?;
+            Read::take(&mut buf, buf_len).read_to_end(&mut temp_buf)?;
+
+            intern_buf.reserve(buf_len as _);
+
+            l.seek(SeekFrom::Start(0))?;
+            io_unary_op(Read::take(&mut *l, buf_len), |x| { intern_buf.extend(x); false })?;
+
+            let d = len - buf_len;
+
+            let mut f = |start, intern_buf: &VecDeque<u8>| {
+                let (front1, back1) = intern_buf.as_slices();
+                let (front2, back2) = temp_buf.split_at(front1.len());
+
+                if front1 == front2 && back1 == back2 {
+                    pos.start_pos = start;
+                    Some((self.get_pos(pos), false))
+                } else {
+                    None
+                }
+            };
+
+            let mut read_buf = [0; BUF_LEN];
+            let mut index = 0;
+
+            io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])?;
+
+            for start in 0..d {
+                if let Some(e) = f(start, &intern_buf) {
+                    return Ok(e)
+                }
+
+                intern_buf.pop_front();
+                intern_buf.push_back(read_buf[index]);
+
+                index += 1;
+
+                if index == BUF_LEN {
+                    io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])?;
+                    index = 0;
+                }
+            }
+
+            if let Some(e) = f(d, &intern_buf) {
+                return Ok(e)
+            }
+        }
+
+        if temp_buf.is_empty() {
+            io::copy(&mut buf, &mut *l)?;
+        } else {
+            l.write_all(&temp_buf)?;
+        }
+
+        l.flush().map(|_| (self.get_pos(pos), true))
+    }
+
+    /*
+    other implementation that does not allocate nothing but benchmarked horrible with files
+    pub fn try_intern<U: Read + Seek>(&self, mut buf: U) -> io::Result<(IOObj<'_, T>, bool)> {
         let mut l = self.inner.lock().unwrap();
 
         let buf_len = buf.seek(SeekFrom::End(0))?;
@@ -108,22 +239,24 @@ impl<T: Write + Read + Seek + ?Sized> IOInterner<T> {
         };
 
         for start in 0..len.saturating_sub(buf_len) {
-            l.seek(SeekFrom::Start(start))?;
             buf.seek(SeekFrom::Start(0))?;
+            l.seek(SeekFrom::Start(start))?;
 
             if starts_with(&mut *l, &mut buf)? {
                 pos.start_pos = start;
-                return Ok((self.get_pos(pos), false));
+                return Ok((self.get_pos(pos), false))
             }
+
         }
 
-        l.seek(SeekFrom::Start(len))?;
-        buf.seek(SeekFrom::Start(0))?;
+        l.seek(SeekFrom::End(0))?;
+            buf.seek(SeekFrom::Start(0))?;
+
         io::copy(&mut buf, &mut *l)?;
         l.flush()?;
-
         Ok((self.get_pos(pos), true))
     }
+    */
 
     /// Creates a new `IOEntry` object that will be able to generate [`IOObj`] that always read
     /// same bytes as `buf` from `T` so `buf` will be written at the end if it's not already.
@@ -131,6 +264,9 @@ impl<T: Write + Read + Seek + ?Sized> IOInterner<T> {
     /// The [`IOObj`] does not implement `Write` as that would mess up equality of two
     /// [`IOEntry`] instances pointing to the same position with same length which it's actually
     /// the comparison algorithm.
+    /// 
+    /// The cursor of the inner [`Mutex<T>`] field it's setted at final of the [`IOPos`] returned
+    /// which would be at final if the data had to be written.
     /// 
     /// # Errors
     /// 
@@ -142,85 +278,37 @@ impl<T: Write + Read + Seek + ?Sized> IOInterner<T> {
     ///
     /// This function panics if the [`Mutex`] it's poisoned.
     /// 
+    /// ## Race conditions
+    /// 
+    /// if a `&File` it's passed down as `buf`,the length of the file it's readed at init and while
+    /// comparing the contents new bytes added thought another `&File` gotta be ignored.
+    /// 
     /// [`seek`][`Seek::seek`]
     /// [`write`][`Write::write`]
     /// [`read`][`Read::read`]
-    pub fn get_or_intern<U: Read + Seek>(&self, buf: U) -> io::Result<IOEntry<'_, T>> {
+    pub fn get_or_intern<U: Read + Seek>(&self, buf: U) -> io::Result<IOObj<'_, T>> {
         self.try_intern(buf).map(|e| e.0)
     }
 
     /// Convenience for `self.get_or_intern(io::Cursor::new(bytes))`.
-    pub fn get_or_intern_bytes(&self, bytes: impl AsRef<[u8]>) -> io::Result<IOEntry<'_, T>> {
+    pub fn get_or_intern_bytes(&self, bytes: impl AsRef<[u8]>) -> io::Result<IOObj<'_, T>> {
         self.get_or_intern(Cursor::new(bytes))
     }
 
     /// Convenience for `self.try_intern(io::Cursor::new(bytes))`.
-    pub fn try_intern_bytes(&self, bytes: impl AsRef<[u8]>) -> io::Result<(IOEntry<'_, T>, bool)> {
+    pub fn try_intern_bytes(&self, bytes: impl AsRef<[u8]>) -> io::Result<(IOObj<'_, T>, bool)> {
         self.try_intern(Cursor::new(bytes))
     }
 
-    /// Creates an [`IOEntry`] out it's first [`IOPos`].
+    /// Creates an [`IOObj`] out it's first [`IOPos`].
     #[inline]
-    pub fn get_pos(&self, pos: IOPos) -> IOEntry<'_, T> {
-        IOEntry {
+    pub fn get_pos(&self, pos: IOPos) -> IOObj<'_, T> {
+        IOObj {
             start_init: pos.start_pos,
+            start: pos.start_pos,
             len: pos.len,
             guard: &self.inner,
         }
-    }
-}
-
-/// A struct generated by [`IOInterner::get_or_intern`] or [`IOInterner::try_intern`].
-pub struct IOEntry<'a, T: ?Sized> {
-    start_init: u64,
-    len: u64,
-    guard: &'a Mutex<T>,
-}
-
-impl<'a, T: ?Sized> Clone for IOEntry<'a, T> {
-    fn clone(&self) -> Self {
-        unsafe { ptr::read(self) }
-    }
-}
-
-impl<'a, T: ?Sized> IOEntry<'a, T> {
-    /// Creates a new [`IOObj`] that can be [`Read`] and [`Seek`].
-    pub fn get_object(&self) -> IOObj<'a, T> {
-        IOObj {
-            start_init: self.start_init,
-            start: self.start_init,
-            len: self.len,
-            guard: self.guard,
-        }
-    }
-
-    /// Convenience for `self.get_object().position()`,see [`IOObj::position`].
-    #[inline]
-    pub fn position(&self) -> IOPos {
-        self.get_object().position()
-    }
-}
-
-impl<'a, T: ?Sized> PartialEq for IOEntry<'a, T> {
-    /// Compares the start position of `self` in the interner and it's length to `other`;returning
-    /// `false` if either are different,`true` otherwise.
-    ///
-    /// # Panics
-    ///
-    /// It panics if `self` and `other` were created from different [`IOInterner`]s.
-    fn eq(&self, other: &Self) -> bool {
-        assert_eq!(self.guard as *const _, other.guard as *const _, "entries from different interners cannot be compared,consider use `IOEntry::get_object` to create `IOObj`ects");
-
-        self.position() == other.position()
-    }
-}
-
-impl<'a, T: ?Sized> Eq for IOEntry<'a, T> {}
-
-impl<'a, T: ?Sized> Hash for IOEntry<'a, T> {
-    /// Hash the start position of the entry and the length.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.position().hash(state)
     }
 }
 
@@ -239,19 +327,6 @@ impl<'a, T: ?Sized> Clone for IOObj<'a, T> {
 }
 
 impl<'a, T: ?Sized> IOObj<'a, T> {
-    /// Converts back to an [`IOEntry`].
-    #[inline]
-    pub fn to_entry(&self) -> IOEntry<'a, T> {
-        let mut a = self.clone();
-        a.seek(SeekFrom::Start(0)).unwrap();
-
-        IOEntry {
-            start_init: a.start,
-            len: a.len,
-            guard: a.guard,
-        }
-    }
-
     fn fields_eq(&self, other: &Self) -> bool {
         ptr::eq(self.guard, other.guard) && self.position() == other.position()
     }
@@ -278,6 +353,7 @@ impl<'a, T: Read + Seek + ?Sized> Read for IOObj<'a, T> {
         l.seek(SeekFrom::Start(self.start))?;
 
         let len = Read::take(&mut *l, self.len).read(buf)?;
+        drop(l);
         self.seek(SeekFrom::Current(len as _))?;
         Ok(len)
     }
@@ -285,8 +361,11 @@ impl<'a, T: Read + Seek + ?Sized> Read for IOObj<'a, T> {
 
 impl<'a, T: Read + Seek + ?Sized> PartialEq for IOObj<'a, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.fields_eq(other)
-            || eq(self.clone(), other.clone()).expect("io error while testing for equality")
+        if ptr::eq(self.guard, other.guard) {
+            self.position() == other.position()
+        } else {
+            eq(self.clone(), other.clone()).expect("io error while testing for equality")
+        }
     }
 }
 
@@ -363,8 +442,29 @@ impl<'a, T: ?Sized> Seek for IOObj<'a, T> {
     }
 }
 
+/*
+r"(?x)
+^
+([Mon|Tue|Wed|Thu|Fri|Sat|Sun]),
+\s+
+(\d{2})
+\s+
+(\d{2})
+\s+
+(\d{4})
+\s+
+\d{2}
+:
+\d{2}
+:
+\d{2}
+\s
+GMT
+$"
+*/
+
 /// Struct stating which data [`IOObj`] will read from the [`IOInterner`] internal IO object.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Default)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct IOPos {
     /// The start position on which the [`IOObj`] can read in the next [`Read::read`].
@@ -398,11 +498,11 @@ pub const BUF_LEN: usize = 512;
 /// # Errors
 ///
 /// See [`io::copy`].
-pub fn io_op<R1: Read, R2: Read, T>(
+pub fn io_op<R1: Read, R2: Read>(
     mut x: R1,
     mut y: R2,
-    mut callback: impl FnMut(&[u8], &[u8]) -> Option<T>,
-) -> io::Result<Option<T>> {
+    mut callback: impl FnMut(&[u8], &[u8]) -> bool,
+) -> io::Result<()> {
     let mut buf1 = [0; BUF_LEN];
     let mut buf2 = [0; BUF_LEN];
 
@@ -416,14 +516,12 @@ pub fn io_op<R1: Read, R2: Read, T>(
         let readed1 = io::copy(&mut x, &mut buf1r)? as usize;
         let readed2 = io::copy(&mut y, &mut buf2r)? as usize;
 
-        let a = callback(&buf1[..readed1], &buf2[..readed2]);
-
-        if a.is_some() {
-            break a;
+        if callback(&buf1[..readed1], &buf2[..readed2]) {
+            break;
         }
 
         if readed1 == 0 || readed2 == 0 {
-            break None;
+            break;
         }
     })
 }
@@ -434,7 +532,8 @@ pub fn io_op<R1: Read, R2: Read, T>(
 ///
 /// See [`io_op`].
 pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
-    io_op(x, y, |x, y| if x == y { None } else { Some(()) }).map(|e| e.is_none())
+    let mut result = true;
+    io_op(x, y, |x, y| { result = x == y; !result }).map(|_| result)
 }
 
 /// Checks if the first contents of the reader `haystack` are the ones of `needle`,an empty needle
@@ -444,14 +543,227 @@ pub fn eq<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<bool> {
 ///
 /// See [`io_op`].
 pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<bool> {
-    io_op(haystack, needle, |haystack, needle| {
-        if haystack.starts_with(needle) {
-            None
-        } else {
-            Some(())
-        }
-    }).map(|e| e.is_none())
+    let mut result = true;
+    io_op(haystack, needle, |x, y| { result = x.starts_with(y); !result }).map(|_| result)
 }
+
+/// Checks if the contents of `needle` are in `haystack`.
+/// 
+/// # Errors
+/// 
+/// See [`io_op`].
+pub fn find<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, mut needle: R2) -> io::Result<Option<IOPos>> {
+        let l = &mut haystack;
+        let mut buf = needle;
+
+        let buf_len = buf.seek(SeekFrom::End(0))?;
+
+        let mut pos = IOPos::default();
+
+        if buf_len == 0 {
+            return Ok(Some(pos));
+        }
+
+        pos.len = buf_len;
+
+        let len = l.seek(SeekFrom::End(0))?;
+
+        if len == buf_len {
+            eq(&mut *l, &mut buf).map(|x| bool::then(x, || pos))
+        } else if buf_len < len {
+            let mut temp_buf = Vec::new();
+            let mut intern_buf = VecDeque::new();
+
+            buf.seek(SeekFrom::Start(0))?;
+            Read::take(&mut buf, buf_len).read_to_end(&mut temp_buf)?;
+
+            intern_buf.reserve(buf_len as _);
+
+            l.seek(SeekFrom::Start(0))?;
+            io_unary_op(Read::take(&mut *l, buf_len), |x| { intern_buf.extend(x); false })?;
+
+            let d = len - buf_len;
+
+            let mut f = |start, intern_buf: &VecDeque<u8>| {
+                let (front1, back1) = intern_buf.as_slices();
+                let (front2, back2) = temp_buf.split_at(front1.len());
+
+                if front1 == front2 && back1 == back2 {
+                    pos.start_pos = start;
+                    Some(pos)
+                } else {
+                    None
+                }
+            };
+
+            let mut read_buf = [0; BUF_LEN];
+            let mut index = 0;
+
+            io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])?;
+
+            for start in 0..d {
+                let x = f(start, &intern_buf);
+                if x.is_some() {
+                    return Ok(x)
+                }
+
+                intern_buf.pop_front();
+                intern_buf.push_back(read_buf[index]);
+
+                index += 1;
+
+                if index == BUF_LEN {
+                    io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])?;
+                    index = 0;
+                }
+            }
+
+            Ok(f(d, &intern_buf))
+        } else {
+            Ok(None)
+        }
+}
+
+
+/// Checks if the contents of `needle` are in `haystack` starting from the end.
+/// 
+/// # Errors
+/// 
+/// See [`io_op`].
+pub fn rfind<R1: Read + Seek, R2: Read + Seek>(mut haystack: R1, mut needle: R2) -> io::Result<Option<IOPos>> {
+        let l = &mut haystack;
+        let mut buf = needle;
+
+        let buf_len = buf.seek(SeekFrom::End(0))?;
+
+        let mut pos = IOPos::default();
+
+        if buf_len == 0 {
+            return Ok(Some(pos));
+        }
+
+        pos.len = buf_len;
+
+        let len = l.seek(SeekFrom::End(0))?;
+
+        if len == buf_len {
+            eq(&mut *l, &mut buf).map(|x| bool::then(x, || pos))
+        } else if buf_len < len {
+            let mut temp_buf = Vec::new();
+            let mut intern_buf = VecDeque::new();
+
+            buf.seek(SeekFrom::Start(0))?;
+            Read::take(&mut buf, buf_len).read_to_end(&mut temp_buf)?;
+
+            intern_buf.reserve(buf_len as _);
+
+            let d = len - buf_len;
+
+            l.seek(SeekFrom::Start(d))?;
+            io_unary_op(Read::take(&mut *l, buf_len), |x| { intern_buf.extend(x); false })?;
+
+            let mut f = |start, intern_buf: &VecDeque<u8>| {
+                let (front1, back1) = intern_buf.as_slices();
+                let (front2, back2) = temp_buf.split_at(front1.len());
+
+                if front1 == front2 && back1 == back2 {
+                    pos.start_pos = start;
+                    Some(pos)
+                } else {
+                    None
+                }
+            };
+
+            let mut cursor = d.saturating_sub(BUF_LEN as _);
+            let mut read_buf = [0; BUF_LEN];
+            l.seek(SeekFrom::Start(cursor))?;
+            let mut index = io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])? as usize;
+
+            for start in (0..d).rev() {
+                let x = f(start, &intern_buf);
+                if x.is_some() {
+                    return Ok(x)
+                }
+
+                intern_buf.push_front(read_buf[index]);
+                intern_buf.pop_back();
+
+                index = if let Some(e) = index.checked_sub(1) {
+                    e
+                } else {
+                    l.seek(SeekFrom::Start(cursor))?;
+                    cursor = d.saturating_sub(BUF_LEN as _);
+                    io::copy(&mut Read::take(&mut *l, BUF_LEN as _), &mut &mut read_buf[..])? as _
+                };
+            }
+
+            Ok(f(d, &intern_buf))
+        } else {
+            Ok(None)
+        }
+}
+/*
+pub fn contains<R1: Read, R2: Read>(mut haystack: R1, mut needle: R2) -> io::Result<bool> {
+        let mut len = 0;
+        let mut buf_len = 0;
+        let mut temp_buf = Vec::new();
+
+        let mut result = true;
+
+        io_op(&mut haystack, &mut needle, |x, y| {
+            len += x.len() as u64;
+            buf_len += y.len() as u64;
+            result = x == y;
+
+            !result
+        })?; 
+
+        if len == buf_len {
+            if eq(haystack, buf)? {
+                return Ok(true)
+            }
+        } else if buf_len < len {
+        let mut intern_buf = VecDeque::new();
+            Read::take(&mut needle, buf_len).read_to_end(&mut temp_buf)?;
+
+            intern_buf.reserve(buf_len as _);
+
+            io_unary_op(Read::take(&mut haystack, buf_len), |x| { intern_buf.extend(x); false })?;
+
+            let d = len - buf_len;
+
+            let mut f = |intern_buf: &VecDeque<u8>| {
+                let (front1, back1) = intern_buf.as_slices();
+                let (front2, back2) = temp_buf.split_at(front1.len());
+
+                front1 == front2 && back1 == back2
+            };
+
+            let mut read_buf = [0; BUF_LEN];
+            let mut index = 0;
+
+            io::copy(&mut Read::take(&mut haystack, BUF_LEN as _), &mut &mut read_buf[..])?;
+
+            for _ in 0..d {
+                intern_buf.pop_front();
+                intern_buf.push_back(read_buf[index]);
+
+                if f(&intern_buf) {
+                    return Ok(true)
+                }
+
+                index += 1;
+
+                if index == BUF_LEN {
+                    io::copy(&mut Read::take(&mut haystack, BUF_LEN as _), &mut &mut read_buf[..])?;
+                    index = 0;
+                }
+            }
+        }
+
+        Ok(false)
+}
+*/
 
 /// Compares the contents of `x` to the ones of `y`,see
 /// [`lexicographical comparison`][`Ord#lexicographical-comparison`].
@@ -460,11 +772,17 @@ pub fn starts_with<R1: Read, R2: Read>(haystack: R1, needle: R2) -> io::Result<b
 ///
 /// See [`io_op`].
 pub fn cmp<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<Ordering> {
-    io_op(x, y, |x, y| match x.cmp(y) {
-        Equal => None,
-        x => Some(x),
+    let mut result = None;
+
+    io_op(x, y, |x, y| {
+        result = match x.cmp(y) {
+            Equal => None,
+            x => Some(x),
+        };
+
+        result.is_none()
     })
-    .map(|e| e.unwrap_or(Equal))
+    .map(|_| result.unwrap_or(Equal))
 }
 
 /// Hash the contents of the reader `x` to `state`.
@@ -475,10 +793,10 @@ pub fn cmp<R1: Read, R2: Read>(x: R1, y: R2) -> io::Result<Ordering> {
 pub fn hash<R1: Read, H: Hasher>(x: R1, state: &mut H) -> io::Result<()> {
     let mut len = 0;
 
-    let _: Option<()> = io_unary_op(x, |x| {
+    io_unary_op(x, |x| {
         Hash::hash_slice(x, state);
         len += x.len();
-        None
+        false
     })?;
 
     len.hash(state);
@@ -487,7 +805,7 @@ pub fn hash<R1: Read, H: Hasher>(x: R1, state: &mut H) -> io::Result<()> {
 }
 
 /// Convert the contents of the `reader` into valid UTF-8 and pass it to callback,passing in `None`
-/// when some bytes are.
+/// when some bytes are not.
 /// 
 /// # Errors
 /// 
@@ -534,8 +852,8 @@ pub fn to_utf8<R: Read, F: FnMut(Option<&str>)>(reader: R, mut callback: F) -> i
                 invalid_slice = Some(slice.len());
             }
 
-            None
-        }).map(|_: Option<()>| ())
+            false
+        })
 }
 
 fn to_utf8_internal<F: FnMut(Option<&str>)>(mut input: &[u8], mut callback: F) -> Option<&[u8]> {
@@ -568,10 +886,10 @@ fn to_utf8_internal<F: FnMut(Option<&str>)>(mut input: &[u8], mut callback: F) -
 /// # Errors
 ///
 /// See [`io::copy`].
-pub fn io_unary_op<R1: Read, T>(
+pub fn io_unary_op<R1: Read>(
     mut x: R1,
-    mut callback: impl FnMut(&[u8]) -> Option<T>,
-) -> io::Result<Option<T>> {
+    mut callback: impl FnMut(&[u8]) -> bool,
+) -> io::Result<()> {
 
     let mut buf1 = [0; BUF_LEN];
 
@@ -582,21 +900,11 @@ pub fn io_unary_op<R1: Read, T>(
 
         let readed1 = io::copy(&mut x, &mut buf1r)? as usize;
 
-        let a = callback(&buf1[..readed1]);
-
-        if a.is_some() {
-            break a;
-        }
-
-        if readed1 == 0 {
-            break None;
+        if readed1 == 0 || callback(&buf1[..readed1]) {
+            break;
         }
     })
 }
-
-#[cfg(feature = "serde_support")]
-pub mod serde {
-    use super::*;
 
     #[inline]
     fn stream_len(mut x: impl Seek) -> io::Result<u64> {
@@ -612,6 +920,10 @@ pub mod serde {
         Ok(len)
     }
 
+#[cfg(feature = "serde_support")]
+pub mod serde {
+    use super::*;
+
     impl<T: Write + Read + Seek + Serialize> Serialize for IOInterner<T> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             self.inner.serialize(serializer)
@@ -620,9 +932,7 @@ pub mod serde {
 
     impl<'a, T: Write + Read + Seek + Deserialize<'a>> Deserialize<'a> for IOInterner<T> {
         fn deserialize<D: Deserializer<'a>>(deserializer: D) -> Result<Self, D::Error> {
-            Ok(Self {
-                inner: <Mutex<T>>::deserialize(deserializer)?
-            })
+            <Mutex<T>>::deserialize(deserializer).map(Self::from_inner)
         }
     }
 
@@ -642,9 +952,15 @@ pub mod serde {
                 Err(e) => break Err(e),
             };
 
-            break io_unary_op(x, |x| serializer.serialize_element(x).err())?
-                .map(|x| Err(x))
-                .unwrap_or_else(|| serializer.end());
+            let mut result = None;
+
+            io_unary_op(x, |x| {
+                result = serializer.serialize_element(x).err();
+
+                result.is_some()
+            })?;
+
+            break result.map(Err).unwrap_or_else(|| serializer.end())
         })
     }
 
@@ -667,104 +983,6 @@ pub mod serde {
             Ok(Err(e)) => SerIOErr::Ser(e),
             Err(e) => SerIOErr::IO(e),
         })
-    }
-
-    /// Struct [io entries][`IOEntry`] serialize to.
-    #[derive(Serialize, Deserialize)]
-    pub struct ToIOEntry<T: Read + Write + Seek> {
-        /// The id of the interner field,other `Self` instances with the same one would be able
-        /// to get entries thought [`IOInterner::get_pos`] on the same interner,and exactly one
-        /// instance of those will have that interner wrapped into a `Some`.
-        pub interner_id: usize,
-        /// The interner for the entry serialized,wrapped into an option because more than one
-        /// [`IOEntry`] could share it and will be serialized only once.
-        pub interner: Option<IOInterner<T>>,
-        /// The position of the [`IOEntry`],useful to use [`IOInterner::get_pos`] on the original
-        /// interner as described in `interner_id`.
-        pub pos: IOPos,
-    }
-
-    impl<'a, T: Read + Write + Seek> ToIOEntry<T> {
-        #[inline]
-        fn fields(&self) -> (IOPos, usize, u8) {
-            // the contents of the interner have not to be checked at testing for equality
-            // because the algorithm test before `interner_id`,if two `ToIOEntry` share same one
-            // both `interner`s cannot be `Some`,so they are told to be equal if both are `None`.
-            (self.pos, self.interner_id, self.interner.is_some() as _)
-        }
-    }
-
-    impl<'a, T: Read + Write + Seek> PartialEq for ToIOEntry<T> {
-        #[inline]
-        fn eq(&self, other: &Self) -> bool {
-            self.fields() == other.fields()
-        }
-    }
-
-    impl<'a, T: Read + Write + Seek> Eq for ToIOEntry<T> {}
-
-    impl<'a, T: Read + Write + Seek> Hash for ToIOEntry<T> {
-        #[inline]
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            self.fields().hash(state)
-        }
-    }
-
-    impl<'a, T: Read + Write + Seek> PartialOrd for ToIOEntry<T> {
-        #[inline]
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    impl<'a, T: Read + Write + Seek> Ord for ToIOEntry<T> {
-        #[inline]
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.fields().cmp(&other.fields())
-        }
-    }
-
-    impl<'a, T: Serialize + Deserialize<'a>> Serialize for IOEntry<'a, T> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            let transform = |x: usize| -> usize { x.rotate_left(x.leading_zeros()) };
-
-    fn contains(needle: usize, x: &[usize]) -> bool {
-        fn bytes<T: ?Sized>(x: &T) -> &[u8] {
-            unsafe { slice::from_raw_parts(x as *const _ as *const u8, mem::size_of_val(x)) }
-        }
-
-        let needle = bytes(&needle);
-        let mut haystack = bytes(&x);
-
-        while let Some(e) = memchr::memchr(needle[0], haystack) {
-            haystack = &haystack[e + 1..];
-
-            if haystack.starts_with(&needle[1..]) {
-                return true
-            }
-        }
-
-        false
-    }
-
-            let interner_id = transform(self.guard as *const _ as _);
-
-            lazy_static::lazy_static! {
-                static ref SERIALIZED: RwLock<Vec<usize>> = RwLock::new(Vec::new());
-            }
-
-            let first_entry = contains(interner_id, &**SERIALIZED.read().unwrap());
-
-            if first_entry {
-                SERIALIZED.write().unwrap().push(interner_id);
-            }
-
-            let mut s = serializer.serialize_struct("ToIOEntry", 3)?;
-            s.serialize_field("interner_id", &interner_id)?;
-            s.serialize_field("interner", &bool::then(first_entry, || self.guard))?;
-            s.serialize_field("pos", &self.position())?;
-            s.end()
-        }
     }
 
     impl<'a, T: Seek + Read> Serialize for IOObj<'a, T> {
